@@ -2,6 +2,8 @@ import argparse
 import os
 from typing import TYPE_CHECKING, AsyncGenerator, Optional, Tuple, Union
 
+import torch
+
 from starlette.datastructures import State
 from starlette.requests import Request
 from vllm.engine.arg_utils import AsyncEngineArgs
@@ -54,6 +56,11 @@ logger = get_logger(__name__)
 def _get_vllm_engine_config(
     llm_config: LLMConfig,
 ) -> Tuple["AsyncEngineArgs", "VllmConfig"]:
+
+    # temporary fix for runai model
+    import vllm.transformers_utils.runai_utils as runai_utils
+    runai_utils.ObjectStorageModel._close = lambda self: None
+
     engine_config = llm_config.get_engine_config()
     async_engine_args = vllm.engine.arg_utils.AsyncEngineArgs(
         **engine_config.get_initialization_kwargs()
@@ -146,56 +153,87 @@ class VLLMEngine(LLMEngine):
             logger.info("Skipping engine restart because the engine is already running")
             return
 
-        from vllm.entrypoints.openai.api_server import init_app_state
+        # Setup torch profiler to generate Chrome trace
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        if torch.cuda.is_available():
+            activities.append(torch.profiler.ProfilerActivity.CUDA)
+        
+        with torch.profiler.profile(
+            activities=activities,
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+            with_flops=True,
+        ) as prof:
+            from vllm.entrypoints.openai.api_server import init_app_state
+            import time
+            start_time = time.monotonic()
+            node_initialization = await initialize_node(self.llm_config)
+            end_time = time.monotonic()
+            print(f"[DEBUG] initialize_node() time: {end_time - start_time}")
+            start_time = time.monotonic()
+            (
+                vllm_engine_args,
+                vllm_frontend_args,
+                vllm_engine_config,
+            ) = self._prepare_engine_config(node_initialization)
+            end_time = time.monotonic()
+            print(f"[DEBUG] _prepare_engine_config() time: {end_time - start_time}")
+            # Apply checkpoint info to the llm_config.
+            # This is needed for capturing model capabilities
+            # (e.g. supports vision, etc.) on the llm_config.
+            # config = self.llm_config.get_engine_config()
+            # self.llm_config.apply_checkpoint_info(
+            #     config.actual_hf_model_id,
+            #     trust_remote_code=config.trust_remote_code,
+            # )
+            self.llm_config.apply_checkpoint_info(
+                vllm_engine_config.model_config.model,
+            )
 
-        node_initialization = await initialize_node(self.llm_config)
+            self._engine_client = self._start_async_llm_engine(
+                vllm_engine_args,
+                vllm_engine_config,
+                node_initialization.placement_group,
+            )
 
-        (
-            vllm_engine_args,
-            vllm_frontend_args,
-            vllm_engine_config,
-        ) = self._prepare_engine_config(node_initialization)
+            state = State()
+            # TODO (Kourosh): There might be some variables that needs protection?
+            args = argparse.Namespace(
+                **vllm_frontend_args.__dict__,
+                **vllm_engine_args.__dict__,
+            )
 
-        # Apply checkpoint info to the llm_config.
-        # This is needed for capturing model capabilities
-        # (e.g. supports vision, etc.) on the llm_config.
-        config = self.llm_config.get_engine_config()
-        self.llm_config.apply_checkpoint_info(
-            config.actual_hf_model_id,
-            trust_remote_code=config.trust_remote_code,
-        )
+            await init_app_state(
+                engine_client=self._engine_client,
+                vllm_config=vllm_engine_config,
+                state=state,
+                args=args,
+            )
 
-        self._engine_client = self._start_async_llm_engine(
-            vllm_engine_args,
-            vllm_engine_config,
-            node_initialization.placement_group,
-        )
+            self._oai_models = state.openai_serving_models
+            self._oai_serving_chat = state.openai_serving_chat
+            self._oai_serving_completion = state.openai_serving_completion
+            self._oai_serving_embedding = state.openai_serving_embedding
+            self._oai_serving_scores = state.openai_serving_scores
 
-        state = State()
-        # TODO (Kourosh): There might be some variables that needs protection?
-        args = argparse.Namespace(
-            **vllm_frontend_args.__dict__,
-            **vllm_engine_args.__dict__,
-        )
+            self._validate_openai_serving_models()
+            self._validate_engine_client()
 
-        await init_app_state(
-            engine_client=self._engine_client,
-            vllm_config=vllm_engine_config,
-            state=state,
-            args=args,
-        )
+            self._running = True
 
-        self._oai_models = state.openai_serving_models
-        self._oai_serving_chat = state.openai_serving_chat
-        self._oai_serving_completion = state.openai_serving_completion
-        self._oai_serving_embedding = state.openai_serving_embedding
-        self._oai_serving_scores = state.openai_serving_scores
-
-        self._validate_openai_serving_models()
-        self._validate_engine_client()
-
-        self._running = True
-
+        # Export the trace to Chrome trace format
+        import datetime
+        import os
+        try:
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            trace_file = os.path.abspath(f"vllm_engine_start_profile_{timestamp}.json")
+            prof.export_chrome_trace(trace_file)
+            logger.info(f"Torch profiling trace saved to: {trace_file}")
+            print(f"[DEBUG] Profiling trace file created at: {trace_file}")
+        except Exception as e:
+            logger.error(f"Failed to export torch profiling trace: {e}")
+            print(f"[DEBUG] Profiling export error: {e}")
         logger.info("Started vLLM engine.")
 
     def _validate_openai_serving_models(self):
@@ -330,13 +368,16 @@ class VLLMEngine(LLMEngine):
 
         executor_class = Executor.get_class(vllm_engine_config)
         logger.info(f"Using executor class: {executor_class}")
+        import time
+        start_time = time.monotonic()
         engine_client = AsyncLLM(
             vllm_config=vllm_engine_config,
             executor_class=executor_class,
             log_stats=not vllm_engine_args.disable_log_stats,
             stat_loggers=custom_stat_loggers,
         )
-
+        end_time = time.monotonic()
+        print(f"[DEBUG] AsyncLLM() time: {time.monotonic() - start_time}")
         return engine_client
 
     async def resolve_lora(self, disk_lora_model: DiskMultiplexConfig):

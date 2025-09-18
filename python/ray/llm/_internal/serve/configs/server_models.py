@@ -268,7 +268,7 @@ class LLMConfig(BaseModelExtended):
             self._model_architecture = model_architecture
 
     def apply_checkpoint_info(
-        self, model_id_or_path: str, trust_remote_code: bool = False
+        self, model_id_or_path: str
     ) -> None:
         """Apply the checkpoint info to the model config."""
         self._infer_supports_vision(model_id_or_path)

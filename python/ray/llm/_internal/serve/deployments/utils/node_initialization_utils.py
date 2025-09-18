@@ -93,6 +93,12 @@ async def initialize_node(llm_config: LLMConfig) -> InitializeNodeOutput:
     pg = engine_config.get_or_create_pg()
     runtime_env = engine_config.get_runtime_env_with_local_env_vars()
 
+    # If the load format is runai_streamer, we don't need to do any initialization.
+    if llm_config.engine_kwargs.get("load_format", "") in ("runai_streamer",):
+        return InitializeNodeOutput(
+            placement_group=pg, runtime_env=runtime_env, extra_init_kwargs=extra_init_kwargs
+        )
+
     if engine_config.placement_strategy == "STRICT_PACK":
         # If the placement strategy is STRICT_PACK, we know that all the
         # workers run on the same node as the engine. Therefore, we can run
